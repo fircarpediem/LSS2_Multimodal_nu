@@ -13,6 +13,7 @@ import numpy as np
 import os
 import time
 from tqdm import tqdm
+import wandb
 
 from src.data import compile_data
 from src.model_vovnet_transformer import compile_model_vovnet_transformer
@@ -337,6 +338,29 @@ def main():
     # Mixed precision scaler
     scaler = GradScaler()
     
+    # Initialize Weights & Biases
+    wandb.init(
+        project="Multimodal-XAD",
+        name=f"VoVNet-{vovnet_type[6:]}_LSS-v2_Transformer",
+        config={
+            "architecture": f"VoVNet-{vovnet_type[6:]} + LSS v2 + Transformer",
+            "dataset": "nu-A2D",
+            "epochs": epochs,
+            "batch_size": bsize,
+            "learning_rate": lr,
+            "backbone_lr_mult": 0.1,
+            "weight_decay": weight_decay,
+            "warmup_epochs": warmup_epochs,
+            "total_params_M": f"{total_params / 1e6:.2f}",
+            "trainable_params_M": f"{trainable_params / 1e6:.2f}",
+            "vovnet_type": vovnet_type,
+            "pretrained": pretrained,
+            "grid_conf": grid_conf,
+            "data_aug_conf": data_aug_conf,
+        }
+    )
+    wandb.watch(model, log="all", log_freq=100)
+    
     # ==================== Training Loop ====================
     best_miou = 0
     best_epoch = 0
@@ -356,6 +380,16 @@ def main():
         print(f"\nEpoch {epoch}/{epochs} - Train Loss: {train_loss:.4f} "
               f"(BEV: {train_bev:.4f}, Act: {train_action:.4f}, Desc: {train_desc:.4f})")
         
+        # Log training metrics
+        wandb.log({
+            "epoch": epoch,
+            "train/loss": train_loss,
+            "train/bev_loss": train_bev,
+            "train/action_loss": train_action,
+            "train/desc_loss": train_desc,
+            "train/lr": optimizer.param_groups[0]['lr'],
+        })
+        
         # Validate every 5 epochs
         if epoch % 5 == 0:
             val_loss, val_info = validate(model, valloader, criterion, device)
@@ -368,6 +402,15 @@ def main():
             print(f"BEV mIoU: {bev_iou:.4f}")
             print(f"Action F1: {action_f1:.4f}")
             print(f"Description F1: {desc_f1:.4f}")
+            
+            # Log validation metrics
+            wandb.log({
+                "epoch": epoch,
+                "val/loss": val_loss,
+                "val/bev_miou": bev_iou,
+                "val/action_f1": action_f1,
+                "val/desc_f1": desc_f1,
+            })
             
             # Save best model
             if bev_iou > best_miou:
@@ -386,6 +429,10 @@ def main():
                 
                 torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
                 print(f"✓ Saved best model (mIoU: {best_miou:.4f})")
+                
+                # Log best model to wandb
+                wandb.run.summary["best_miou"] = best_miou
+                wandb.run.summary["best_epoch"] = best_epoch
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
@@ -402,6 +449,9 @@ def main():
     
     print(f"\nTraining completed!")
     print(f"Best mIoU: {best_miou:.4f} at epoch {best_epoch}")
+    
+    # Finish wandb run
+    wandb.finish()
 
 
 if __name__ == '__main__':
