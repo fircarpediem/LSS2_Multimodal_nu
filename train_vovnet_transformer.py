@@ -259,8 +259,8 @@ def main():
     # For fair comparison with EfficientNet-B4 (19M): use vovnet39 (22M)
     # For maximum performance: use vovnet57 (36M)
     vovnet_type = 'vovnet39'  # Options: 'vovnet39' (22M, fair), 'vovnet57' (36M, best)
-    pretrained = True  # Load ImageNet pretrained weights
-    bsize = 5  # vovnet39 can handle batch size 5-6 on 3090
+    pretrained = True  # Load ImageNet pretrained weights (mimics paper's pre-training)
+    bsize = 8  # Paper: batch_size=8 for main training
     grid_conf = {
         'xbound': [-50.0, 50.0, 0.5],
         'ybound': [-50.0, 50.0, 0.5],
@@ -279,13 +279,17 @@ def main():
         'Ncams': 6,
     }
     
-    # Training config
-    epochs = 80
-    lr = 2e-4
-    weight_decay = 1e-4
+    # Training config (matching paper)
+    epochs = 60  # Paper: 60 epochs for main training
+    lr = 1e-4  # Paper: 1×10^-4
+    weight_decay = 1e-8  # Paper: 1×10^-8 (very small!)
     warmup_epochs = 5
     num_workers = 4
     save_dir = './checkpoints_vovnet_transformer'
+    
+    # Pre-training config
+    use_pretrained_weights = True  # Load pre-trained encoder+BEV weights
+    pretrained_path = './pretrain_vovnet/best_pretrained.pth'  # Path to pre-trained checkpoint
     
     # Data paths  
     dataroot = './data/trainval/nu-A2D-20260129T100537Z-3-001/nu-A2D'
@@ -307,6 +311,23 @@ def main():
     )
     model = model.to(device)
     
+    # Load pre-trained weights if available
+    if use_pretrained_weights and os.path.exists(pretrained_path):
+        print(f"Loading pre-trained weights from: {pretrained_path}")
+        pretrained_ckpt = torch.load(pretrained_path, map_location=device)
+        
+        # Load encoder + BEV weights (skip action/desc heads)
+        model.backbone.load_state_dict(pretrained_ckpt['backbone_state_dict'])
+        model.depth_net.load_state_dict(pretrained_ckpt['depth_net_state_dict'])
+        model.cam_encode.load_state_dict(pretrained_ckpt['cam_encode_state_dict'])
+        model.bev_encoder.load_state_dict(pretrained_ckpt['bev_encoder_state_dict'])
+        
+        print(f"✓ Loaded pre-trained encoder + BEV (mIoU: {pretrained_ckpt.get('miou', 0):.4f})")
+        print("  Action and Description heads initialized randomly")
+    elif use_pretrained_weights:
+        print(f"⚠️  Pre-trained weights not found at {pretrained_path}")
+        print("  Training from ImageNet pretrained weights only")
+    
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -324,9 +345,9 @@ def main():
     # Loss function
     criterion = MultiTaskLoss(device=device)
     
-    # Optimizer with layer-wise LR
+    # Optimizer with layer-wise LR (Paper uses Adam, not AdamW)
     param_groups = get_parameter_groups(model, lr, backbone_lr_mult=0.1)
-    optimizer = optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+    optimizer = optim.Adam(param_groups, lr=lr, weight_decay=weight_decay)  # Paper: Adam
     
     # Learning rate scheduler
     num_training_steps = epochs * len(trainloader)
