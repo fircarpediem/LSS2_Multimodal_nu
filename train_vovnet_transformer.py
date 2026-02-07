@@ -13,11 +13,17 @@ import numpy as np
 import os
 import time
 from tqdm import tqdm
-import wandb
+
+# Optional: Weights & Biases for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Training will proceed without logging to W&B.")
 
 from src.data import compile_data
 from src.model_vovnet_transformer import compile_model_vovnet_transformer
-from src.tools import MultiLoss, get_val_info_new
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6):
@@ -78,32 +84,35 @@ class MultiTaskLoss(nn.Module):
 
 
 def get_parameter_groups(model, lr, backbone_lr_mult=0.1):
-    """Layer-wise learning rate decay"""
+    """Layer-wise learning rate decay
+    
+    Pretrained modules (lower LR):
+    - backbone, depth_net, cam_encode, bev_encoder
+    
+    New modules (higher LR):
+    - vovnet_adapter, sceneunder, embeders, predictors, bev_post
+    """
     param_groups = [
-        # Backbone (VoVNet) with lower LR
+        # Backbone (VoVNet) with lower LR (pretrained)
         {
             'params': [p for n, p in model.named_parameters() if 'backbone' in n and p.requires_grad],
             'lr': lr * backbone_lr_mult,
             'name': 'backbone'
         },
-        # Depth network
-        {
-            'params': [p for n, p in model.named_parameters() if 'depth_net' in n and p.requires_grad],
-            'lr': lr,
-            'name': 'depth_net'
-        },
-        # Transformer
-        {
-            'params': [p for n, p in model.named_parameters() if 'transformer' in n and p.requires_grad],
-            'lr': lr,
-            'name': 'transformer'
-        },
-        # Task heads
+        # Pretrained BEV branch modules with lower LR
         {
             'params': [p for n, p in model.named_parameters() 
-                      if not any(x in n for x in ['backbone', 'depth_net', 'transformer']) and p.requires_grad],
-            'lr': lr,
-            'name': 'heads'
+                      if any(x in n for x in ['depth_net', 'cam_encode', 'bev_encoder']) and p.requires_grad],
+            'lr': lr * backbone_lr_mult,  # Lower LR for pretrained modules
+            'name': 'pretrained_bev'
+        },
+        # New TXT branch and task heads with higher LR (trained from scratch)
+        {
+            'params': [p for n, p in model.named_parameters() 
+                      if not any(x in n for x in ['backbone', 'depth_net', 'cam_encode', 'bev_encoder']) 
+                      and p.requires_grad],
+            'lr': lr,  # Higher LR for new modules
+            'name': 'new_modules'
         }
     ]
     
@@ -243,7 +252,7 @@ def validate(model, dataloader, criterion, device):
     all_desc_gts = torch.cat(all_desc_gts, dim=0)
     
     # Compute metrics
-    val_info = get_val_info_new(
+    val_info = compute_metrics_from_predictions(
         all_bev_preds, all_action_preds, all_desc_preds,
         all_bev_gts, all_action_gts, all_desc_gts
     )
@@ -251,6 +260,55 @@ def validate(model, dataloader, criterion, device):
     avg_loss = total_loss / len(dataloader)
     
     return avg_loss, val_info
+
+
+def compute_metrics_from_predictions(bev_preds, action_preds, desc_preds, 
+                                      bev_gts, action_gts, desc_gts):
+    """
+    Compute evaluation metrics from collected predictions
+    
+    Args:
+        bev_preds: (N, 4, H, W) BEV segmentation logits
+        action_preds: (N, 4) Action logits
+        desc_preds: (N, 8) Description logits
+        bev_gts: (N, H, W) BEV ground truth
+        action_gts: (N, 4) Action labels
+        desc_gts: (N, 8) Description labels
+    
+    Returns:
+        Dictionary with metrics: {'iou', 'action_f1', 'desc_f1'}
+    """
+    from src.tools import ConfusionMatrix
+    from sklearn.metrics import f1_score
+    
+    # 1. BEV Segmentation mIoU
+    pred_classes = bev_preds.argmax(1)
+    confmat = ConfusionMatrix(4)
+    confmat.update(bev_gts.flatten(), pred_classes.flatten())
+    _, _, ious = confmat.compute()
+    bev_iou = ious.mean().item()
+    
+    # 2. Action F1 Score
+    action_preds_binary = (torch.sigmoid(action_preds) > 0.5).cpu().numpy()
+    action_gts_numpy = action_gts.cpu().numpy()
+    action_f1 = f1_score(action_gts_numpy.flatten(), 
+                         action_preds_binary.flatten(), 
+                         average='macro', 
+                         zero_division=0)
+    
+    # 3. Description F1 Score  
+    desc_preds_binary = (torch.sigmoid(desc_preds) > 0.5).cpu().numpy()
+    desc_gts_numpy = desc_gts.cpu().numpy()
+    desc_f1 = f1_score(desc_gts_numpy.flatten(), 
+                       desc_preds_binary.flatten(), 
+                       average='macro', 
+                       zero_division=0)
+    
+    return {
+        'iou': bev_iou,
+        'action_f1': action_f1,
+        'desc_f1': desc_f1
+    }
 
 
 def main():
@@ -359,28 +417,29 @@ def main():
     # Mixed precision scaler
     scaler = GradScaler()
     
-    # Initialize Weights & Biases
-    wandb.init(
-        project="Multimodal-XAD",
-        name=f"VoVNet-{vovnet_type[6:]}_LSS-v2_Transformer",
-        config={
-            "architecture": f"VoVNet-{vovnet_type[6:]} + LSS v2 + Transformer",
-            "dataset": "nu-A2D",
-            "epochs": epochs,
-            "batch_size": bsize,
-            "learning_rate": lr,
-            "backbone_lr_mult": 0.1,
-            "weight_decay": weight_decay,
-            "warmup_epochs": warmup_epochs,
-            "total_params_M": f"{total_params / 1e6:.2f}",
-            "trainable_params_M": f"{trainable_params / 1e6:.2f}",
-            "vovnet_type": vovnet_type,
-            "pretrained": pretrained,
-            "grid_conf": grid_conf,
-            "data_aug_conf": data_aug_conf,
-        }
-    )
-    wandb.watch(model, log="all", log_freq=100)
+    # Initialize Weights & Biases (optional)
+    if WANDB_AVAILABLE:
+        wandb.init(
+            project="Multimodal-XAD",
+            name=f"VoVNet-{vovnet_type[6:]}_LSS-v2_Transformer",
+            config={
+                "architecture": f"VoVNet-{vovnet_type[6:]} + LSS v2 + Transformer",
+                "dataset": "nu-A2D",
+                "epochs": epochs,
+                "batch_size": bsize,
+                "learning_rate": lr,
+                "backbone_lr_mult": 0.1,
+                "weight_decay": weight_decay,
+                "warmup_epochs": warmup_epochs,
+                "total_params_M": f"{total_params / 1e6:.2f}",
+                "trainable_params_M": f"{trainable_params / 1e6:.2f}",
+                "vovnet_type": vovnet_type,
+                "pretrained": pretrained,
+                "grid_conf": grid_conf,
+                "data_aug_conf": data_aug_conf,
+            }
+        )
+        wandb.watch(model, log="all", log_freq=100)
     
     # ==================== Training Loop ====================
     best_miou = 0
@@ -402,14 +461,15 @@ def main():
               f"(BEV: {train_bev:.4f}, Act: {train_action:.4f}, Desc: {train_desc:.4f})")
         
         # Log training metrics
-        wandb.log({
-            "epoch": epoch,
-            "train/loss": train_loss,
-            "train/bev_loss": train_bev,
-            "train/action_loss": train_action,
-            "train/desc_loss": train_desc,
-            "train/lr": optimizer.param_groups[0]['lr'],
-        })
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "train/bev_loss": train_bev,
+                "train/action_loss": train_action,
+                "train/desc_loss": train_desc,
+                "train/lr": optimizer.param_groups[0]['lr'],
+            })
         
         # Validate every 5 epochs
         if epoch % 5 == 0:
@@ -425,13 +485,14 @@ def main():
             print(f"Description F1: {desc_f1:.4f}")
             
             # Log validation metrics
-            wandb.log({
-                "epoch": epoch,
-                "val/loss": val_loss,
-                "val/bev_miou": bev_iou,
-                "val/action_f1": action_f1,
-                "val/desc_f1": desc_f1,
-            })
+            if WANDB_AVAILABLE:
+                wandb.log({
+                    "epoch": epoch,
+                    "val/loss": val_loss,
+                    "val/bev_miou": bev_iou,
+                    "val/action_f1": action_f1,
+                    "val/desc_f1": desc_f1,
+                })
             
             # Save best model
             if bev_iou > best_miou:
@@ -452,8 +513,9 @@ def main():
                 print(f"✓ Saved best model (mIoU: {best_miou:.4f})")
                 
                 # Log best model to wandb
-                wandb.run.summary["best_miou"] = best_miou
-                wandb.run.summary["best_epoch"] = best_epoch
+                if WANDB_AVAILABLE:
+                    wandb.run.summary["best_miou"] = best_miou
+                    wandb.run.summary["best_epoch"] = best_epoch
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
@@ -472,7 +534,8 @@ def main():
     print(f"Best mIoU: {best_miou:.4f} at epoch {best_epoch}")
     
     # Finish wandb run
-    wandb.finish()
+    if WANDB_AVAILABLE:
+        wandb.finish()
 
 
 if __name__ == '__main__':
