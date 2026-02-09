@@ -11,12 +11,12 @@ try:
     from .vovnet_timm import VoVNetV2  # Use timm backend (correct + pretrained)
     from .transformer_modules import LightweightBEVTransformer
     from .tools import gen_dx_bx, QuickCumsum
-    from .modules import BevPost, Predictor
+    from .modules import BevPost, Predictor, SceneUnder, Embedder_f1, Embedder_f2, Embedder_lr1, Embedder_lr2
 except ImportError:
     from vovnet_timm import VoVNetV2
     from transformer_modules import LightweightBEVTransformer
     from tools import gen_dx_bx, QuickCumsum
-    from modules import BevPost, Predictor
+    from modules import BevPost, Predictor, SceneUnder, Embedder_f1, Embedder_f2, Embedder_lr1, Embedder_lr2
 
 
 class MultiScaleDepthNet(nn.Module):
@@ -156,9 +156,31 @@ class BEVEncoderTransformer(nn.Module):
         return seg, refined
 
 
+class VoVNetAdapter(nn.Module):
+    """Adapter to convert VoVNet C3 features to format compatible with SceneUnder"""
+    def __init__(self, in_channels=768, out_channels=512, target_size=(8, 22)):
+        super().__init__()
+        self.target_size = target_size
+        self.adapter = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        """Convert (B*N, 768, H, W) -> (B*N, 512, 8, 22)"""
+        x = self.adapter(x)
+        x = F.adaptive_avg_pool2d(x, self.target_size)
+        return x
+
+
 class VoVNetBEVTransformer(nn.Module):
     """
-    VoVNet-V2 + LSS v2 + Lightweight Transformer
+    VoVNet-V2 + LSS v2 + Lightweight Transformer + Per-Camera Reasoning
+    2-Branch Architecture (BEV Branch + TXT Branch) similar to BEV_TXT
     For multi-modal BEV perception (BEV seg + Action + Description)
     
     Args:
@@ -214,30 +236,32 @@ class VoVNetBEVTransformer(nn.Module):
             out_channels=outC
         )
         
-        # BEV post-processing for action/desc
+        # BEV post-processing for action/desc fusion
         self.bev_post = BevPost(in_channels=256, out_channels=8)
         
-        # Action & Description heads
-        # BevPost output: (B, 8, 8, 22) after crop and pooling
-        self.action_head = nn.Sequential(
-            nn.Linear(8 * 8 * 22, 256),  # 1408 -> 256
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(128, 4)
+        # ============ TXT Branch (Per-Camera Reasoning) ============
+        # Adapter to convert VoVNet features to SceneUnder format
+        self.vovnet_adapter = VoVNetAdapter(
+            in_channels=self.backbone.c3_channels,  # 768
+            out_channels=512,
+            target_size=(8, 22)
         )
         
-        self.desc_head = nn.Sequential(
-            nn.Linear(8 * 8 * 22, 256),  # 1408 -> 256
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(128, 8)
-        )
+        # SceneUnder: ASPP for per-camera scene understanding
+        self.sceneunder = SceneUnder(in_channels=512)
+        
+        # Embedders for front camera (different from left/right)
+        self.embeder_f1 = Embedder_f1(in_channels=256, out_channels=32)
+        self.embeder_f2 = Embedder_f2(out_channels=40)
+        
+        # Embedders for left/right cameras (shared)
+        self.embeder_lr1 = Embedder_lr1(in_channels=256, out_channels=32)
+        self.embeder_lr2 = Embedder_lr2(out_channels=40)
+        
+        # Predictors for action and description
+        self.predictorf1 = Predictor(num_in=40, classes=4)  # Action (front camera)
+        self.predictorf2 = Predictor(num_in=40, classes=4)  # Description (front camera)
+        self.predictorlr = Predictor(num_in=40, classes=1)  # Description (left/right cameras)
         
         self.use_quickcumsum = True
     
@@ -282,8 +306,9 @@ class VoVNetBEVTransformer(nn.Module):
         # Quantize to voxel grid
         geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
-        batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
-                             device=x.device, dtype=torch.long) for ix in range(B)])
+        # Create batch indices (correct indexing)
+        points_per_batch = N * D * H * W
+        batch_ix = torch.arange(B, device=x.device, dtype=torch.long).repeat_interleave(points_per_batch).view(-1, 1)
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
         
         # Filter out-of-bounds
@@ -315,24 +340,34 @@ class VoVNetBEVTransformer(nn.Module):
     
     def forward(self, imgs, rots, trans, intrins, post_rots, post_trans):
         """
+        Two-branch forward pass: BEV Branch + TXT Branch (per-camera reasoning)
+        
         Args:
-            imgs: (B*N, 3, H, W) - N cameras
+            imgs: (B*N, 3, H, W) or (B, N, 3, H, W) - N cameras (flexible input)
             rots, trans, intrins: Camera parameters
             post_rots, post_trans: Data augmentation parameters
             
         Returns:
             bev_seg: (B, 4, 200, 200) - BEV segmentation
-            action: (B, 4) - Action prediction
-            desc: (B, 8) - Description prediction
+            action: (B, 4) - Action prediction (from front camera + BEV)
+            desc: (B, 8) - Description prediction (from all 6 cameras + BEV)
         """
-        B = self.bsize
-        N = imgs.shape[0] // B
+        # Handle both input shapes: (B, N, C, H, W) and (B*N, C, H, W)
+        if len(imgs.shape) == 5:
+            # Input: (B, N, C, H, W)
+            B, N, C, H, W = imgs.shape
+            imgs = imgs.view(B * N, C, H, W)
+        else:
+            # Input: (B*N, C, H, W) - infer B and N from geometry
+            B = rots.shape[0]
+            N = imgs.shape[0] // B
         
-        # Extract multi-scale features with VoVNet-99
+        # Extract multi-scale features with VoVNet
         feat_dict = self.backbone(imgs)
         c3 = feat_dict['c3']  # (B*N, 768, H, W)
         c4 = feat_dict['c4']  # (B*N, 1024, H, W)
         
+        # ============ BEV BRANCH ============
         # Multi-scale depth prediction (LSS v2)
         depth = self.depth_net(c3, c4)  # (B*N, D, H, W) at C3 resolution
         
@@ -353,27 +388,80 @@ class VoVNetBEVTransformer(nn.Module):
         # BEV encoder with transformer
         bev_seg, bev_refined = self.bev_encoder(bev_feats)
         
-        # Crop center region for action/desc (same as original)
+        # Crop center region and extract BEV features for fusion with per-camera
         bev_crop = bev_refined[:, :, 60:140, 56:144]  # (B, 256, 80, 88)
-        bev_feat = self.bev_post(bev_crop)  # (B, 8, 19, 22)
-        bev_feat_flat = bev_feat.flatten(1)  # (B, 8*19*22)
+        bev_post = self.bev_post(bev_crop)  # (B, 8, 8, 22)
         
-        # Action & Description prediction
-        action = self.action_head(bev_feat_flat)
-        desc = self.desc_head(bev_feat_flat)
+        # ============ TXT BRANCH (Per-Camera Reasoning) ============
+        # Adapt VoVNet C3 features to SceneUnder format
+        adapted_feats = self.vovnet_adapter(c3)  # (B*N, 512, 8, 22)
         
-        return bev_seg, action, desc
+        # SceneUnder: ASPP for scene understanding
+        y1 = self.sceneunder(adapted_feats)  # (B*N, 256, 8, 22)
+        
+        # Split features by camera (assuming 6 cameras: FL, F, FR, BL, B, BR)
+        Ncams = self.data_aug_conf['Ncams']
+        y_l_1 = y1[0::Ncams]  # Left Front (CAM_FRONT_LEFT)
+        y_f = y1[1::Ncams]     # Front (CAM_FRONT)
+        y_r_1 = y1[2::Ncams]   # Right Front (CAM_FRONT_RIGHT)
+        y_l_2 = y1[3::Ncams]   # Left Back (CAM_BACK_LEFT)
+        y_r_2 = y1[5::Ncams]   # Right Back (CAM_BACK_RIGHT)
+        # Note: CAM_BACK (index 4) not used in original BEV_TXT
+        
+        # ========== Front Camera Processing (Action + Description) ==========
+        y_f = self.embeder_f1(y_f)  # (B, 32, 8, 22)
+        y_f = torch.cat([y_f, bev_post], dim=1)  # (B, 32+8, 8, 22) = (B, 40, 8, 22)
+        y_f = self.embeder_f2(y_f)  # (B, 40)
+        
+        desc_f = self.predictorf1(y_f)  # (B, 4) - Front camera description contribution
+        act_f = self.predictorf2(y_f)   # (B, 4) - Action prediction
+        
+        # ========== Left Front Camera Processing ==========
+        y_l_1 = self.embeder_lr1(y_l_1)  # (B, 32, 8, 22)
+        y_l_1 = torch.cat([y_l_1, bev_post], dim=1)  # (B, 40, 8, 22)
+        y_l_1 = self.embeder_lr2(y_l_1)  # (B, 40)
+        desc_l1 = self.predictorlr(y_l_1)  # (B, 1)
+        
+        # ========== Right Front Camera Processing ==========
+        y_r_1 = self.embeder_lr1(y_r_1)
+        y_r_1 = torch.cat([y_r_1, bev_post], dim=1)
+        y_r_1 = self.embeder_lr2(y_r_1)
+        desc_r1 = self.predictorlr(y_r_1)  # (B, 1)
+        
+        # ========== Left Back Camera Processing ==========
+        y_l_2 = self.embeder_lr1(y_l_2)
+        y_l_2 = torch.cat([y_l_2, bev_post], dim=1)
+        y_l_2 = self.embeder_lr2(y_l_2)
+        desc_l2 = self.predictorlr(y_l_2)  # (B, 1)
+        
+        # ========== Right Back Camera Processing ==========
+        y_r_2 = self.embeder_lr1(y_r_2)
+        y_r_2 = torch.cat([y_r_2, bev_post], dim=1)
+        y_r_2 = self.embeder_lr2(y_r_2)
+        desc_r2 = self.predictorlr(y_r_2)  # (B, 1)
+        
+        # Concatenate all description predictions
+        # Total: 4 (front) + 1 (left_front) + 1 (left_back) + 1 (right_front) + 1 (right_back) = 8
+        desc = torch.cat([desc_f, desc_l1, desc_l2, desc_r1, desc_r2], dim=1)  # (B, 8)
+        
+        return bev_seg, act_f, desc
 
 
 def compile_model_vovnet_transformer(bsize, grid_conf, data_aug_conf, outC, vovnet_type='vovnet39', pretrained=True):
-    """Factory function to create model
+    """Factory function to create VoVNet + LSS v2 + Transformer + TXT Branch model
+    
+    This model combines:
+    - VoVNet backbone (better than EfficientNet)
+    - LSS v2 multi-scale depth prediction
+    - Transformer-based BEV refinement
+    - Per-camera reasoning (TXT branch) similar to BEV_TXT
     
     Args:
         vovnet_type (str): 'vovnet39' (default), 'vovnet57', or 'vovnet99'
-            - vovnet39: 22M params, ~14.5GB memory, fastest (RECOMMENDED for fair comparison)
-            - vovnet57: 36M params, ~15.5GB memory, balanced
-            - vovnet99: 54M params, ~16.5GB memory, best performance (not available pretrained)
-        pretrained (bool): Load ImageNet pretrained weights (recommended)
+            - vovnet39: ~25M params (backbone 22M + TXT branch ~3M), fastest (RECOMMENDED)
+            - vovnet57: ~39M params (backbone 36M + TXT branch ~3M), balanced
+            - vovnet99: not recommended (no pretrained weights available)
+        pretrained (bool): Load ImageNet pretrained weights for backbone (recommended)
     """
     return VoVNetBEVTransformer(bsize, grid_conf, data_aug_conf, outC, vovnet_type=vovnet_type, pretrained=pretrained)
 
@@ -402,13 +490,14 @@ def test_model():
     outC = 4
     
     print("=" * 70)
-    print("Testing VoVNetV2-BEV-Transformer Models")
+    print("Testing VoVNet + LSS v2 + Transformer + TXT Branch Models")
+    print("2-Branch Architecture: BEV Branch + Per-Camera Reasoning (TXT)")
     print("=" * 70)
     
     # Only test available models (vovnet99 has no pretrained weights in timm)
     for vovnet_type in ['vovnet39', 'vovnet57']:
         print(f"\n{'='*70}")
-        print(f"Model: VoVNetV2-{vovnet_type[6:].upper()} + LSS v2 + Transformer")
+        print(f"Model: VoVNetV2-{vovnet_type[6:].upper()} + LSS v2 + Transformer + TXT")
         print(f"{'='*70}")
         
         model = compile_model_vovnet_transformer(
