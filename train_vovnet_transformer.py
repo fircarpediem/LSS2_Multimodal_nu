@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 import numpy as np
 import os
@@ -39,18 +39,32 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 
 class MultiTaskLoss(nn.Module):
-    """Multi-task loss for BEV segmentation + Action + Description"""
-    def __init__(self, device='cuda'):
+    """Multi-task loss for BEV segmentation + Action + Description
+    
+    Fixed issues:
+    1. Remove per-class weights for BCE (not supported)
+    2. Add task balancing weights
+    3. Use pos_weight for class imbalance in BCE
+    """
+    def __init__(self, device='cuda', bev_weight=1.0, action_weight=0.5, desc_weight=0.5):
         super().__init__()
-        # BEV segmentation weights (4 classes)
-        bev_weights = torch.FloatTensor([1, 10, 5, 10]).to(device)
-        self.bev_loss_fn = nn.CrossEntropyLoss(weight=bev_weights)
         
-        # Action classification weights (4 classes)
-        self.action_weights = torch.FloatTensor([1, 5, 5, 5]).to(device)
+        # Task balancing weights
+        self.bev_weight = bev_weight
+        self.action_weight = action_weight
+        self.desc_weight = desc_weight
         
-        # Description classification weights (8 classes)
-        self.desc_weights = torch.FloatTensor([1, 5, 5, 5, 1, 1, 1, 1]).to(device)
+        # BEV segmentation: class weights for CrossEntropyLoss
+        bev_class_weights = torch.FloatTensor([1.0, 10.0, 5.0, 10.0]).to(device)
+        self.bev_loss_fn = nn.CrossEntropyLoss(weight=bev_class_weights)
+        
+        # Action: pos_weight for class imbalance (not per-class weight!)
+        # Positive class more important (5x weight)
+        self.action_pos_weight = torch.FloatTensor([5.0, 5.0, 5.0, 5.0]).to(device)
+        
+        # Description: pos_weight for class imbalance
+        # First 4 classes more important
+        self.desc_pos_weight = torch.FloatTensor([5.0, 5.0, 5.0, 5.0, 1.0, 1.0, 1.0, 1.0]).to(device)
     
     def forward(self, bev_pred, action_pred, desc_pred, bev_gt, action_gt, desc_gt):
         """
@@ -59,26 +73,34 @@ class MultiTaskLoss(nn.Module):
             action_pred: (B, 4) Action logits
             desc_pred: (B, 8) Description logits
             bev_gt: (B, H, W) BEV ground truth
-            action_gt: (B, 4) Action labels
-            desc_gt: (B, 8) Description labels
+            action_gt: (B, 4) Action labels (0 or 1)
+            desc_gt: (B, 8) Description labels (0 or 1)
         Returns:
             loss_total, loss_bev, loss_action, loss_desc
         """
-        # BEV loss
+        # BEV loss (spatial segmentation)
         loss_bev = self.bev_loss_fn(bev_pred, bev_gt)
         
-        # Action loss (binary cross entropy)
+        # Action loss (binary classification with pos_weight for imbalance)
         loss_action = F.binary_cross_entropy_with_logits(
-            action_pred, action_gt, weight=self.action_weights
+            action_pred, 
+            action_gt.float(),
+            pos_weight=self.action_pos_weight
         )
         
-        # Description loss (binary cross entropy)
+        # Description loss (binary classification with pos_weight)
         loss_desc = F.binary_cross_entropy_with_logits(
-            desc_pred, desc_gt, weight=self.desc_weights
+            desc_pred, 
+            desc_gt.float(),
+            pos_weight=self.desc_pos_weight
         )
         
-        # Total loss
-        loss_total = loss_bev + loss_action + loss_desc
+        # Total loss with task balancing
+        loss_total = (
+            self.bev_weight * loss_bev + 
+            self.action_weight * loss_action + 
+            self.desc_weight * loss_desc
+        )
         
         return loss_total, loss_bev, loss_action, loss_desc
 
@@ -146,7 +168,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, 
         imgs = imgs.view(B * N, C, H, W)
         
         # Mixed precision training
-        with autocast():
+        with autocast(device_type='cuda', dtype=torch.float16):
             # Forward pass
             bev_pred, action_pred, desc_pred = model(
                 imgs, rots, trans, intrins, post_rots, post_trans
@@ -166,10 +188,9 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, 
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
         
+        # Optimizer step BEFORE scheduler (fix warning)
         scaler.step(optimizer)
         scaler.update()
-        
-        # Update learning rate
         scheduler.step()
         
         # Logging
@@ -223,7 +244,7 @@ def validate(model, dataloader, criterion, device):
             imgs = imgs.view(B * N, C, H, W)
             
             # Forward pass
-            with autocast():
+            with autocast(device_type='cuda', dtype=torch.float16):
                 bev_pred, action_pred, desc_pred = model(
                     imgs, rots, trans, intrins, post_rots, post_trans
                 )
@@ -400,8 +421,16 @@ def main():
         parser_name='segmentationdata'
     )
     
-    # Loss function
-    criterion = MultiTaskLoss(device=device)
+    # Loss function with task balancing
+    # bev_weight=1.0: Spatial segmentation (main task)
+    # action_weight=0.5: Action prediction (important for safety)
+    # desc_weight=0.5: Description (scene understanding)
+    criterion = MultiTaskLoss(
+        device=device,
+        bev_weight=1.0,
+        action_weight=0.5,
+        desc_weight=0.5
+    )
     
     # Optimizer with layer-wise LR (Paper uses Adam, not AdamW)
     param_groups = get_parameter_groups(model, lr, backbone_lr_mult=0.1)
@@ -414,8 +443,8 @@ def main():
         optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6
     )
     
-    # Mixed precision scaler
-    scaler = GradScaler()
+    # Mixed precision scaler (updated API)
+    scaler = GradScaler('cuda')
     
     # Initialize Weights & Biases (optional)
     if WANDB_AVAILABLE:
