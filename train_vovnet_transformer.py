@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import argparse
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 import numpy as np
@@ -24,6 +25,29 @@ except ImportError:
 
 from src.data import compile_data
 from src.model_vovnet_transformer import compile_model_vovnet_transformer
+
+
+VERSION_FLAGS = {
+    'V1': {'use_camera_attn': False, 'use_cross_attn': False},
+    'V2': {'use_camera_attn': True, 'use_cross_attn': False},
+    'V3': {'use_camera_attn': True, 'use_cross_attn': True},
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train VoVNet Transformer ablation versions.')
+    parser.add_argument('--version', type=str, default='V3', choices=['V1', 'V2', 'V3'])
+    parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--vovnet_type', type=str, default='vovnet39', choices=['vovnet39', 'vovnet57', 'vovnet99'])
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_vovnet_transformer')
+    parser.add_argument('--run_name', type=str, default='')
+    parser.add_argument('--save_suffix', type=str, default='')
+    parser.add_argument('--dataroot', type=str, default='./data/trainval/nu-A2D-20260129T100537Z-3-001/nu-A2D')
+    parser.add_argument('--pretrained_path', type=str, default='./pretrain_vovnet/best_pretrained.pth')
+    parser.add_argument('--no_pretrained', action='store_true', help='Disable loading pretrained weights.')
+    return parser.parse_args()
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6):
@@ -333,13 +357,16 @@ def compute_metrics_from_predictions(bev_preds, action_preds, desc_preds,
 
 
 def main():
+    args = parse_args()
+
     # ==================== Configuration ====================
     # Model config
     # For fair comparison with EfficientNet-B4 (19M): use vovnet39 (22M)
     # For maximum performance: use vovnet57 (36M)
-    vovnet_type = 'vovnet39'  # Options: 'vovnet39' (22M, fair), 'vovnet57' (36M, best)
+    vovnet_type = args.vovnet_type  # Options: 'vovnet39' (22M, fair), 'vovnet57' (36M, best)
     pretrained = True  # Load ImageNet pretrained weights (mimics paper's pre-training)
-    bsize = 8  # Paper: batch_size=8 for main training
+    bsize = args.batch_size  # Paper: batch_size=8 for main training
+    version_flags = VERSION_FLAGS[args.version]
     grid_conf = {
         'xbound': [-50.0, 50.0, 0.5],
         'ybound': [-50.0, 50.0, 0.5],
@@ -359,19 +386,21 @@ def main():
     }
     
     # Training config (matching paper)
-    epochs = 60  # Paper: 60 epochs for main training
+    epochs = args.epochs  # Paper: 60 epochs for main training
     lr = 1e-4  # Paper: 1×10^-4
     weight_decay = 1e-8  # Paper: 1×10^-8 (very small!)
     warmup_epochs = 5
-    num_workers = 4
-    save_dir = './checkpoints_vovnet_transformer'
+    num_workers = args.num_workers
+    save_dir = args.save_dir
+    if args.save_suffix:
+        save_dir = f"{save_dir}{args.save_suffix}"
     
     # Pre-training config
-    use_pretrained_weights = True  # Load pre-trained encoder+BEV weights
-    pretrained_path = './pretrain_vovnet/best_pretrained.pth'  # Path to pre-trained checkpoint
+    use_pretrained_weights = not args.no_pretrained  # Load pre-trained encoder+BEV weights
+    pretrained_path = args.pretrained_path  # Path to pre-trained checkpoint
     
     # Data paths  
-    dataroot = './data/trainval/nu-A2D-20260129T100537Z-3-001/nu-A2D'
+    dataroot = args.dataroot
     version = 'trainval'
     
     # Create save directory
@@ -383,10 +412,14 @@ def main():
     
     # Create model
     print(f"Creating VoVNetV2-{vovnet_type[6:].upper()} + LSS v2 + Transformer...")
+    print(f"Ablation version: {args.version} | camera_attn={version_flags['use_camera_attn']} | cross_attn={version_flags['use_cross_attn']}")
     print(f"Pretrained: {pretrained}")
     model = compile_model_vovnet_transformer(
         bsize, grid_conf, data_aug_conf, outC=4, 
-        vovnet_type=vovnet_type, pretrained=pretrained
+        vovnet_type=vovnet_type,
+        pretrained=pretrained,
+        use_camera_attn=version_flags['use_camera_attn'],
+        use_cross_attn=version_flags['use_cross_attn'],
     )
     model = model.to(device)
     
@@ -448,12 +481,14 @@ def main():
     
     # Initialize Weights & Biases (optional)
     if WANDB_AVAILABLE:
+        run_name = args.run_name or f"{args.version}_VoVNet-{vovnet_type[6:]}_LSS-v2_Transformer"
         wandb.init(
             project="Multimodal-XAD",
-            name=f"VoVNet-{vovnet_type[6:]}_LSS-v2_Transformer",
+            name=run_name,
             config={
                 "architecture": f"VoVNet-{vovnet_type[6:]} + LSS v2 + Transformer",
                 "dataset": "nu-A2D",
+                "ablation_version": args.version,
                 "epochs": epochs,
                 "batch_size": bsize,
                 "learning_rate": lr,
@@ -464,6 +499,8 @@ def main():
                 "trainable_params_M": f"{trainable_params / 1e6:.2f}",
                 "vovnet_type": vovnet_type,
                 "pretrained": pretrained,
+                "use_camera_attn": version_flags['use_camera_attn'],
+                "use_cross_attn": version_flags['use_cross_attn'],
                 "grid_conf": grid_conf,
                 "data_aug_conf": data_aug_conf,
             }
@@ -538,8 +575,9 @@ def main():
                     'val_info': val_info,
                 }
                 
-                torch.save(checkpoint, os.path.join(save_dir, 'best_model.pth'))
-                print(f"✓ Saved best model (mIoU: {best_miou:.4f})")
+                best_ckpt_name = f"best_model_{args.version}.pth"
+                torch.save(checkpoint, os.path.join(save_dir, best_ckpt_name))
+                print(f"✓ Saved best model: {best_ckpt_name} (mIoU: {best_miou:.4f})")
                 
                 # Log best model to wandb
                 if WANDB_AVAILABLE:
@@ -555,7 +593,7 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
             }
-            torch.save(checkpoint, os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth'))
+            torch.save(checkpoint, os.path.join(save_dir, f'checkpoint_{args.version}_epoch_{epoch}.pth'))
         
         print("=" * 60)
     
