@@ -70,6 +70,23 @@ class MultiScaleDepthNet(nn.Module):
         return depth_prob
 
 
+class StandardDepthNet(nn.Module):
+    """Standard single-scale depth prediction (LSS v1 baseline)."""
+    def __init__(self, c3_channels=768, depth_channels=41):
+        super().__init__()
+
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(c3_channels, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, depth_channels, 1)
+        )
+
+    def forward(self, c3, c4=None):
+        depth_logits = self.depth_head(c3)
+        return F.softmax(depth_logits, dim=1)
+
+
 class CamEncodeV2(nn.Module):
     """Camera encoding with depth (LSS v2)"""
     def __init__(self, D, C_in, C_out):
@@ -336,7 +353,7 @@ class UnifiedPredictor(nn.Module):
 
 class VoVNetBEVTransformer(nn.Module):
     """
-    VoVNet-V2 + LSS v2 + Lightweight Transformer + Per-Camera Reasoning
+    VoVNet-V2 + LSS (v1/v2) + Lightweight Transformer + Per-Camera Reasoning
     2-Branch Architecture (BEV Branch + TXT Branch) similar to BEV_TXT
     For multi-modal BEV perception (BEV seg + Action + Description)
     
@@ -351,6 +368,7 @@ class VoVNetBEVTransformer(nn.Module):
         outC=4,
         vovnet_type='vovnet57',
         pretrained=True,
+        lss_version='v2',
         use_camera_attn=True,
         use_cross_attn=True,
     ):
@@ -359,8 +377,12 @@ class VoVNetBEVTransformer(nn.Module):
         self.grid_conf = grid_conf
         self.data_aug_conf = data_aug_conf
         self.vovnet_type = vovnet_type
+        self.lss_version = lss_version.lower()
         self.use_camera_attn = use_camera_attn
         self.use_cross_attn = use_cross_attn
+
+        if self.lss_version not in {'v1', 'v2'}:
+            raise ValueError(f"Unsupported lss_version: {lss_version}. Use 'v1' or 'v2'.")
         
         # Grid parameters
         dx, bx, nx = gen_dx_bx(
@@ -383,13 +405,19 @@ class VoVNetBEVTransformer(nn.Module):
         # VoVNet-V2 backbone (configurable)
         self.backbone = VoVNetV2(model_name=vovnet_type, pretrained=pretrained)
         
-        # Multi-scale depth prediction (LSS v2)
+        # Depth prediction: standard LSS v1 or multi-scale LSS v2
         # All VoVNet variants output 768 (C3) and 1024 (C4) channels
-        self.depth_net = MultiScaleDepthNet(
-            c3_channels=self.backbone.c3_channels,
-            c4_channels=self.backbone.c4_channels,
-            depth_channels=self.D
-        )
+        if self.lss_version == 'v2':
+            self.depth_net = MultiScaleDepthNet(
+                c3_channels=self.backbone.c3_channels,
+                c4_channels=self.backbone.c4_channels,
+                depth_channels=self.D
+            )
+        else:
+            self.depth_net = StandardDepthNet(
+                c3_channels=self.backbone.c3_channels,
+                depth_channels=self.D
+            )
         
         # Camera encoding (LSS v2)
         # Use C3 features since depth is computed at C3 resolution
@@ -559,7 +587,7 @@ class VoVNetBEVTransformer(nn.Module):
         c4 = feat_dict['c4']  # (B*N, 1024, H, W)
         
         # ============ BEV BRANCH ============
-        # Multi-scale depth prediction
+        # Depth prediction (LSS v1 or v2)
         depth = self.depth_net(c3, c4)  # (B*N, D, H, W)
         
         # Camera encoding with depth
@@ -618,14 +646,15 @@ def compile_model_vovnet_transformer(
     outC,
     vovnet_type='vovnet39',
     pretrained=True,
+    lss_version='v2',
     use_camera_attn=True,
     use_cross_attn=True,
 ):
-    """Factory function to create VoVNet + LSS v2 + Transformer + Improved TXT Branch
+    """Factory function to create VoVNet + LSS (v1/v2) + Transformer + Improved TXT Branch
     
     This model combines:
     - VoVNet backbone (better than EfficientNet)
-    - LSS v2 multi-scale depth prediction
+    - LSS depth prediction (v1 standard or v2 multi-scale)
     - Transformer-based BEV refinement
     - IMPROVED TXT branch with:
         * Cross-camera attention (learn camera relationships)
@@ -652,6 +681,7 @@ def compile_model_vovnet_transformer(
         outC,
         vovnet_type=vovnet_type,
         pretrained=pretrained,
+        lss_version=lss_version,
         use_camera_attn=use_camera_attn,
         use_cross_attn=use_cross_attn,
     )
