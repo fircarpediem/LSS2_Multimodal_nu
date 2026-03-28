@@ -199,11 +199,11 @@ class AdaptiveFeaturePyramid(nn.Module):
 
 class LightweightCameraTransformer(nn.Module):
     """Lightweight cross-camera attention (single layer)"""
-    def __init__(self, d_model=256, n_heads=4, dropout=0.1):
+    def __init__(self, d_model=256, n_heads=4, dropout=0.1, n_cameras=6):
         super().__init__()
         
-        # Camera type embeddings (6 cameras)
-        self.cam_embed = nn.Embedding(6, d_model)
+        # Camera type embeddings (supports dynamic camera count)
+        self.cam_embed = nn.Embedding(n_cameras, d_model)
         
         # Single transformer layer (lightweight)
         self.self_attn = nn.MultiheadAttention(
@@ -289,11 +289,11 @@ class BEVCameraFusion(nn.Module):
 
 class UnifiedPredictor(nn.Module):
     """Unified predictor for action and description (all cameras contribute)"""
-    def __init__(self, input_dim=256, num_action_classes=4, num_desc_classes=8):
+    def __init__(self, input_dim=256, num_action_classes=4, num_desc_classes=8, n_cameras=6):
         super().__init__()
         
         # Learnable camera importance weights
-        self.camera_weights = nn.Parameter(torch.ones(6) / 6)
+        self.camera_weights = nn.Parameter(torch.ones(n_cameras) / n_cameras)
         
         # Shared encoder
         self.encoder = nn.Sequential(
@@ -343,12 +343,24 @@ class VoVNetBEVTransformer(nn.Module):
     Args:
         vovnet_type (str): 'vovnet39' (default), 'vovnet57', or 'vovnet99'
     """
-    def __init__(self, bsize, grid_conf, data_aug_conf, outC=4, vovnet_type='vovnet57', pretrained=True):
+    def __init__(
+        self,
+        bsize,
+        grid_conf,
+        data_aug_conf,
+        outC=4,
+        vovnet_type='vovnet57',
+        pretrained=True,
+        use_camera_attn=True,
+        use_cross_attn=True,
+    ):
         super().__init__()
         self.bsize = bsize
         self.grid_conf = grid_conf
         self.data_aug_conf = data_aug_conf
         self.vovnet_type = vovnet_type
+        self.use_camera_attn = use_camera_attn
+        self.use_cross_attn = use_cross_attn
         
         # Grid parameters
         dx, bx, nx = gen_dx_bx(
@@ -403,32 +415,39 @@ class VoVNetBEVTransformer(nn.Module):
         # 2. SceneUnder for multi-scale context
         self.sceneunder = SceneUnder(in_channels=256)
         
-        # 3. Lightweight camera transformer (cross-camera attention)
-        self.camera_transformer = LightweightCameraTransformer(
-            d_model=256,
-            n_heads=4,
-            dropout=0.1
+        # Camera names for ID mapping
+        self.camera_names = data_aug_conf['cams']
+        self.n_cameras = len(self.camera_names)
+        self.register_buffer(
+            'camera_ids',
+            torch.tensor([i for i in range(self.n_cameras)], dtype=torch.long)
         )
-        
-        # 4. BEV-camera fusion (cross-attention)
-        self.bev_fusion = BEVCameraFusion(
-            camera_dim=256,
-            bev_dim=256,
-            n_heads=4
-        )
-        
+
+        # 3. Optional camera transformer (V2/V3)
+        self.camera_transformer = None
+        if self.use_camera_attn:
+            self.camera_transformer = LightweightCameraTransformer(
+                d_model=256,
+                n_heads=4,
+                dropout=0.1,
+                n_cameras=self.n_cameras,
+            )
+
+        # 4. Optional BEV-camera fusion (V3)
+        self.bev_fusion = None
+        if self.use_cross_attn:
+            self.bev_fusion = BEVCameraFusion(
+                camera_dim=256,
+                bev_dim=256,
+                n_heads=4,
+            )
+
         # 5. Unified predictor (all cameras contribute to both tasks)
         self.unified_predictor = UnifiedPredictor(
             input_dim=256,
             num_action_classes=4,
-            num_desc_classes=8
-        )
-        
-        # Camera names for ID mapping
-        self.camera_names = data_aug_conf['cams']
-        self.register_buffer(
-            'camera_ids',
-            torch.tensor([i for i in range(len(self.camera_names))], dtype=torch.long)
+            num_desc_classes=8,
+            n_cameras=self.n_cameras,
         )
         
         self.use_quickcumsum = True
@@ -575,12 +594,16 @@ class VoVNetBEVTransformer(nn.Module):
         # Reshape to separate cameras
         scene_global = scene_global.view(B, N, -1)  # (B, N, 256)
         
-        # 4. Cross-camera attention (learn relationships)
+        # 4. Optional cross-camera attention (V2/V3)
         camera_ids_batch = self.camera_ids.unsqueeze(0).expand(B, -1)  # (B, N)
-        scene_attended = self.camera_transformer(scene_global, camera_ids_batch)  # (B, N, 256)
+        scene_attended = scene_global
+        if self.camera_transformer is not None:
+            scene_attended = self.camera_transformer(scene_global, camera_ids_batch)  # (B, N, 256)
         
-        # 5. BEV-camera fusion (cross-attention)
-        fused_features = self.bev_fusion(scene_attended, bev_refined)  # (B, N, 256)
+        # 5. Optional BEV-camera fusion (V3)
+        fused_features = scene_attended
+        if self.bev_fusion is not None:
+            fused_features = self.bev_fusion(scene_attended, bev_refined)  # (B, N, 256)
         
         # 6. Unified prediction (all cameras contribute to both tasks)
         action, description = self.unified_predictor(fused_features)
@@ -588,7 +611,16 @@ class VoVNetBEVTransformer(nn.Module):
         return bev_seg, action, description
 
 
-def compile_model_vovnet_transformer(bsize, grid_conf, data_aug_conf, outC, vovnet_type='vovnet39', pretrained=True):
+def compile_model_vovnet_transformer(
+    bsize,
+    grid_conf,
+    data_aug_conf,
+    outC,
+    vovnet_type='vovnet39',
+    pretrained=True,
+    use_camera_attn=True,
+    use_cross_attn=True,
+):
     """Factory function to create VoVNet + LSS v2 + Transformer + Improved TXT Branch
     
     This model combines:
@@ -613,7 +645,16 @@ def compile_model_vovnet_transformer(bsize, grid_conf, data_aug_conf, outC, vovn
             - vovnet57: ~41M params (backbone 36M + improved TXT ~5M), better accuracy
         pretrained (bool): Load ImageNet pretrained weights (recommended)
     """
-    return VoVNetBEVTransformer(bsize, grid_conf, data_aug_conf, outC, vovnet_type=vovnet_type, pretrained=pretrained)
+    return VoVNetBEVTransformer(
+        bsize,
+        grid_conf,
+        data_aug_conf,
+        outC,
+        vovnet_type=vovnet_type,
+        pretrained=pretrained,
+        use_camera_attn=use_camera_attn,
+        use_cross_attn=use_cross_attn,
+    )
 
 
 def test_model():
