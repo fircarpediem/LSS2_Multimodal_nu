@@ -1,6 +1,6 @@
 """
-Pre-training script for VoVNet + LSS v2
-Following paper: 60 epochs, batch_size=12, train encoder+BEV on nuScenes
+Pre-training script for VoVNet + LSS (v1/v2).
+Default pre-training setting uses LSSv1 for the current ablation pipeline.
 """
 
 import torch
@@ -12,21 +12,40 @@ import os
 import argparse
 from tqdm import tqdm
 
+# Optional: Weights & Biases for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Pre-training will proceed without logging to W&B.")
+
 from src.data_pretrain import compile_data
 from src.model_vovnet_transformer import VoVNetBEVTransformer
 from src.vovnet_timm import VoVNetV2
+from src.tools import QuickCumsum
 
 
 class PreTrainingModel(nn.Module):
-    """Pre-training model: VoVNet encoder + LSS v2 + BEV decoder (no action/desc heads)"""
-    def __init__(self, bsize, grid_conf, data_aug_conf, outC=4, vovnet_type='vovnet39', pretrained=True):
+    """Pre-training model: VoVNet encoder + LSS + BEV decoder (no action/desc heads)."""
+    def __init__(
+        self,
+        bsize,
+        grid_conf,
+        data_aug_conf,
+        outC=4,
+        vovnet_type='vovnet39',
+        pretrained=True,
+        lss_version='v1',
+    ):
         super(PreTrainingModel, self).__init__()
+        self.lss_version = lss_version.lower()
         
         # Create full model
         from src.model_vovnet_transformer import compile_model_vovnet_transformer
         full_model = compile_model_vovnet_transformer(
             bsize, grid_conf, data_aug_conf, outC=outC,
-            vovnet_type=vovnet_type, pretrained=pretrained
+            vovnet_type=vovnet_type, pretrained=pretrained, lss_version=self.lss_version
         )
         
         # Extract only encoder and BEV components (no action/desc heads)
@@ -73,8 +92,9 @@ class PreTrainingModel(nn.Module):
         # Batch and flatten geometry
         geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
-        batch_ix = torch.cat([torch.full([Nprime//B, 1], ix, device=x.device, dtype=torch.long) 
-                             for ix in range(B)])
+        # Create batch indices (correct indexing)
+        points_per_batch = N * D * H * W
+        batch_ix = torch.arange(B, device=x.device, dtype=torch.long).repeat_interleave(points_per_batch).view(-1, 1)
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
         
         # Filter out of bounds
@@ -92,11 +112,11 @@ class PreTrainingModel(nn.Module):
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
         
-        x, geom_feats = cumsum_trick(x, geom_feats, ranks)
+        x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
         
-        # Reshape to BEV
-        final = torch.zeros((B, C, self.nx[2], self.nx[1], self.nx[0]), device=x.device)
-        final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 1], geom_feats[:, 0]] = x
+        # Reshape to BEV (correct dimension order)
+        final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
+        final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]] = x
         
         # Collapse Z
         final = torch.cat(final.unbind(dim=2), 1)  # (B, C*Z, H, W)
@@ -168,19 +188,6 @@ def cumsum_trick(x, geom_feats, ranks):
     x = torch.cat((x[:1], x[1:] - x[:-1]))
     
     return x, geom_feats
-        
-    def forward(self, imgs, rots, trans, intrins, post_rots, post_trans):
-        """Forward pass (BEV segmentation only)"""
-        # Camera encoding
-        cam_features = self.camencode(imgs, rots, trans, intrins, post_rots, post_trans)
-        
-        # BEV encoding
-        bev_features = self.bevencode(cam_features)
-        
-        # BEV segmentation
-        bev_seg = self.seg_decoder(bev_features)
-        
-        return bev_seg
 
 
 def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, device, epoch):
@@ -199,7 +206,10 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, criterion, 
         post_trans = batch[5].to(device)
         binimgs = batch[6].to(device)
         
-        # Note: imgs is [B, N, C, H, W], model will handle reshaping
+        # Reshape imgs from [B, N, C, H, W] to [B*N, C, H, W] (consistent with validation)
+        # Even though model can handle both, explicit is better for clarity
+        B, N, C, H, W = imgs.shape
+        imgs = imgs.view(B * N, C, H, W)
         
         optimizer.zero_grad()
         
@@ -244,7 +254,10 @@ def validate(model, dataloader, criterion, device):
             post_trans = batch[5].to(device)
             binimgs = batch[6].to(device)
             
-            # Note: imgs is [B, N, C, H, W], model will handle reshaping
+            # Reshape imgs from [B, N, C, H, W] to [B*N, C, H, W] (consistent with training)
+            # Even though model can handle both, explicit is better for clarity
+            B, N, C, H, W = imgs.shape
+            imgs = imgs.view(B * N, C, H, W)
             
             # Forward pass
             with autocast():
@@ -279,11 +292,13 @@ def validate(model, dataloader, criterion, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-training VoVNet + LSS v2")
+    parser = argparse.ArgumentParser(description="Pre-training VoVNet + LSS")
     
     # Model config
     parser.add_argument('--vovnet_type', default='vovnet39', choices=['vovnet39', 'vovnet57'],
                         help='VoVNet backbone type')
+    parser.add_argument('--lss_version', default='v1', choices=['v1', 'v2'],
+                        help='LSS version used during pre-training')
     parser.add_argument('--pretrained', default=True, type=bool,
                         help='Use ImageNet pretrained weights')
     
@@ -331,10 +346,12 @@ def main():
     }
     
     # Create model
-    print(f"Creating pre-training model: VoVNet-{args.vovnet_type[6:].upper()} + LSS v2")
+    print(f"Creating pre-training model: VoVNet-{args.vovnet_type[6:].upper()} + LSS {args.lss_version}")
     model = PreTrainingModel(
         args.bsize, grid_conf, data_aug_conf, outC=4,
-        vovnet_type=args.vovnet_type, pretrained=args.pretrained
+        vovnet_type=args.vovnet_type,
+        pretrained=args.pretrained,
+        lss_version=args.lss_version,
     ).to(device)
     
     # Count parameters
@@ -377,6 +394,27 @@ def main():
     # Create save directory
     os.makedirs(args.save_dir, exist_ok=True)
     
+    # Initialize Weights & Biases (optional)
+    if WANDB_AVAILABLE:
+        wandb.init(
+            project="Multimodal-XAD-Pretrain",
+            name=f"VoVNet-{args.vovnet_type[6:]}_LSS-{args.lss_version}_Pretrain",
+            config={
+                "architecture": f"VoVNet-{args.vovnet_type[6:]} + LSS {args.lss_version}",
+                "dataset": "nuScenes (nu-A2D)",
+                "task": "BEV Pre-training",
+                "lss_version": args.lss_version,
+                "epochs": args.epochs,
+                "batch_size": args.bsize,
+                "learning_rate": args.lr,
+                "weight_decay": args.weight_decay,
+                "warmup_epochs": args.warmup_epochs,
+                "total_params_M": f"{total_params / 1e6:.2f}",
+                "vovnet_type": args.vovnet_type,
+                "pretrained": args.pretrained,
+            }
+        )
+    
     # Training loop
     best_miou = 0
     best_epoch = 0
@@ -396,11 +434,27 @@ def main():
         
         print(f"\nEpoch {epoch}/{args.epochs} - Train Loss: {train_loss:.4f}")
         
+        # Log to wandb
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "train/lr": optimizer.param_groups[0]['lr'],
+            })
+        
         # Validate every 5 epochs
         if epoch % 5 == 0:
             val_loss, val_miou = validate(model, valloader, criterion, device)
             
             print(f"Validation - Loss: {val_loss:.4f}, mIoU: {val_miou:.4f}")
+            
+            # Log to wandb
+            if WANDB_AVAILABLE:
+                wandb.log({
+                    "epoch": epoch,
+                    "val/loss": val_loss,
+                    "val/miou": val_miou,
+                })
             
             # Save best model
             if val_miou > best_miou:
@@ -410,6 +464,7 @@ def main():
                 # Save encoder + BEV weights only (for loading into main training)
                 checkpoint = {
                     'epoch': epoch,
+                    'lss_version': args.lss_version,
                     'backbone_state_dict': model.backbone.state_dict(),
                     'depth_net_state_dict': model.depth_net.state_dict(),
                     'cam_encode_state_dict': model.cam_encode.state_dict(),
@@ -421,11 +476,17 @@ def main():
                 save_path = os.path.join(args.save_dir, 'best_pretrained.pth')
                 torch.save(checkpoint, save_path)
                 print(f"✓ Saved best pre-trained model (mIoU: {best_miou:.4f})")
+                
+                # Log to wandb
+                if WANDB_AVAILABLE:
+                    wandb.run.summary["best_miou"] = best_miou
+                    wandb.run.summary["best_epoch"] = best_epoch
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
             checkpoint = {
                 'epoch': epoch,
+                'lss_version': args.lss_version,
                 'backbone_state_dict': model.backbone.state_dict(),
                 'depth_net_state_dict': model.depth_net.state_dict(),
                 'cam_encode_state_dict': model.cam_encode.state_dict(),
@@ -440,6 +501,10 @@ def main():
     print(f"\nPre-training completed!")
     print(f"Best mIoU: {best_miou:.4f} at epoch {best_epoch}")
     print(f"Pre-trained weights saved to: {args.save_dir}/best_pretrained.pth")
+    
+    # Finish wandb run
+    if WANDB_AVAILABLE:
+        wandb.finish()
 
 
 if __name__ == '__main__':

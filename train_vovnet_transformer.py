@@ -1,6 +1,6 @@
 """
-Training script for VoVNet-99 + LSS v2 + Transformer
-Optimized for RTX 3090 24GB VRAM
+Training script for VoVNet + LSS (v1/v2) + Transformer.
+Default ablation setting uses standard LSSv1.
 """
 
 import torch
@@ -37,6 +37,7 @@ VERSION_FLAGS = {
 def parse_args():
     parser = argparse.ArgumentParser(description='Train VoVNet Transformer ablation versions.')
     parser.add_argument('--version', type=str, default='V3', choices=['V1', 'V2', 'V3'])
+    parser.add_argument('--lss_version', type=str, default='v1', choices=['v1', 'v2'])
     parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=4)
@@ -364,6 +365,7 @@ def main():
     # For fair comparison with EfficientNet-B4 (19M): use vovnet39 (22M)
     # For maximum performance: use vovnet57 (36M)
     vovnet_type = args.vovnet_type  # Options: 'vovnet39' (22M, fair), 'vovnet57' (36M, best)
+    lss_version = args.lss_version.lower()
     pretrained = True  # Load ImageNet pretrained weights (mimics paper's pre-training)
     bsize = args.batch_size  # Paper: batch_size=8 for main training
     version_flags = VERSION_FLAGS[args.version]
@@ -411,13 +413,14 @@ def main():
     print(f"Using device: {device}")
     
     # Create model
-    print(f"Creating VoVNetV2-{vovnet_type[6:].upper()} + LSS v2 + Transformer...")
-    print(f"Ablation version: {args.version} | camera_attn={version_flags['use_camera_attn']} | cross_attn={version_flags['use_cross_attn']}")
+    print(f"Creating VoVNetV2-{vovnet_type[6:].upper()} + LSS {lss_version.upper()} + Transformer...")
+    print(f"Ablation version: {args.version} | lss={lss_version} | camera_attn={version_flags['use_camera_attn']} | cross_attn={version_flags['use_cross_attn']}")
     print(f"Pretrained: {pretrained}")
     model = compile_model_vovnet_transformer(
         bsize, grid_conf, data_aug_conf, outC=4, 
         vovnet_type=vovnet_type,
         pretrained=pretrained,
+        lss_version=lss_version,
         use_camera_attn=version_flags['use_camera_attn'],
         use_cross_attn=version_flags['use_cross_attn'],
     )
@@ -428,9 +431,14 @@ def main():
         print(f"Loading pre-trained weights from: {pretrained_path}")
         pretrained_ckpt = torch.load(pretrained_path, map_location=device)
         
-        # Load encoder + BEV weights (skip action/desc heads)
+        # Load encoder + BEV weights (skip action/desc heads).
+        # For LSSv1 ablation with an LSSv2 checkpoint, depth_net may be incompatible.
         model.backbone.load_state_dict(pretrained_ckpt['backbone_state_dict'])
-        model.depth_net.load_state_dict(pretrained_ckpt['depth_net_state_dict'])
+        try:
+            model.depth_net.load_state_dict(pretrained_ckpt['depth_net_state_dict'])
+            print("  ✓ Loaded depth_net weights")
+        except RuntimeError as e:
+            print(f"  ⚠️  Skipped depth_net weights due to mismatch ({lss_version} vs checkpoint): {e}")
         model.cam_encode.load_state_dict(pretrained_ckpt['cam_encode_state_dict'])
         model.bev_encoder.load_state_dict(pretrained_ckpt['bev_encoder_state_dict'])
         
@@ -481,14 +489,15 @@ def main():
     
     # Initialize Weights & Biases (optional)
     if WANDB_AVAILABLE:
-        run_name = args.run_name or f"{args.version}_VoVNet-{vovnet_type[6:]}_LSS-v2_Transformer"
+        run_name = args.run_name or f"{args.version}_VoVNet-{vovnet_type[6:]}_LSS-{lss_version}_Transformer"
         wandb.init(
             project="Multimodal-XAD",
             name=run_name,
             config={
-                "architecture": f"VoVNet-{vovnet_type[6:]} + LSS v2 + Transformer",
+            "architecture": f"VoVNet-{vovnet_type[6:]} + LSS {lss_version} + Transformer",
                 "dataset": "nu-A2D",
                 "ablation_version": args.version,
+            "lss_version": lss_version,
                 "epochs": epochs,
                 "batch_size": bsize,
                 "learning_rate": lr,
